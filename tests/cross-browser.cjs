@@ -27,6 +27,14 @@ const profiles = {
                 try {
                     const page = await context.newPage();
                     await page.addInitScript(() => {
+                        // Observe native readings without replacing browser geolocation behavior.
+                        const getPosition = navigator.geolocation.getCurrentPosition.bind(navigator.geolocation);
+                        window.nativeLocationReadings = [];
+                        navigator.geolocation.getCurrentPosition = (success, failure, options) => getPosition(position => {
+                            nativeLocationReadings.push({ timestamp: position.timestamp, receivedAt: Date.now(),
+                                accuracy: position.coords.accuracy });
+                            success(position);
+                        }, failure, options);
                         // Camera is deliberately outside this location-engine suite.
                         Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {
                             value: async () => { throw new Error('Camera fixture unavailable'); }
@@ -45,7 +53,16 @@ const profiles = {
                         return route.fulfill({ body: url.includes('cdn.tailwindcss.com') ? 'window.tailwind = {};' : '' });
                     });
                     await page.goto('http://localhost:8123/');
-                    await page.waitForFunction(() => state.locationReady);
+                    try {
+                        await page.waitForFunction(() => state.locationReady);
+                    } catch (error) {
+                        console.error(`${engine} ${profile.name} initialization failed`, await page.evaluate(() => ({
+                            readyState: document.readyState, visibility: document.visibilityState,
+                            secureContext: window.isSecureContext, message: state.locationMessage,
+                            reading: state.locationReading, nativeReadings: window.nativeLocationReadings
+                        })), { pageErrors: errors });
+                        throw error;
+                    }
                     assert.equal(await page.locator('#boxLatitude').textContent(), '10.000000° N');
                     assert.match(await page.locator('#boxAccuracy').textContent(), /15 m/);
                     assert.match(await page.locator('#boxLocationAge').textContent(), /seconds/);
