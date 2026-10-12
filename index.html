@@ -217,7 +217,7 @@
                 <div class="flex items-center justify-between">
                     <div class="flex items-center space-x-2 text-blue-400 text-sm font-bold">
                         <i class="fa-solid fa-compass"></i>
-                        <span>System Verified GPS Location</span>
+                        <span>Device Location</span>
                     </div>
                     <button id="btnResyncGps" class="text-xs text-slate-400 hover:text-white flex items-center space-x-1 bg-slate-800/80 hover:bg-slate-700 px-2.5 py-1 rounded-lg border border-slate-700 transition">
                         <i class="fa-solid fa-rotate text-[10px]"></i>
@@ -229,11 +229,16 @@
                 <div>
                     <label class="block text-[10px] uppercase tracking-wider font-bold text-slate-500 mb-1">LOCKED ADDRESS</label>
                     <div class="w-full bg-[#0B0F19] border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-bold text-xs sm:text-sm tracking-wide uppercase flex items-center justify-between">
-                        <span id="boxLockedAddress" class="truncate">WAITING FOR GPS</span>
+                        <span id="boxLockedAddress" class="min-w-0 break-words">WAITING FOR GPS</span>
                         <i class="fa-solid fa-lock text-slate-600 text-xs ml-2"></i>
                     </div>
                 </div>
 
+                <div class="text-xs text-slate-300 space-y-1">
+                    <p>Accuracy: <span id="boxAccuracy">Unavailable</span></p>
+                    <p>Reading age: <span id="boxLocationAge">Unavailable</span></p>
+                    <p id="locationStatus" role="status" aria-live="polite">Waiting for location.</p>
+                </div>
                 <!-- Lat / Lon Side-by-side -->
                 <div class="grid grid-cols-2 gap-3">
                     <div>
@@ -352,11 +357,12 @@
     </div>
 
     <!-- Toast Notification Container -->
-    <div id="toastContainer" class="fixed top-16 left-1/2 -translate-x-1/2 z-50 flex flex-col space-y-2 pointer-events-none"></div>
+    <div id="toastContainer" class="fixed top-16 left-1/2 -translate-x-1/2 z-50 w-[calc(100%-2rem)] max-w-xl flex flex-col space-y-2 pointer-events-none"></div>
 
     <!-- Hidden Canvas Element for JPG Output Rendering -->
     <canvas id="hiddenCanvas" class="hidden"></canvas>
 
+    <script src="location-config.js"></script>
     <script>
         // APP STATE
         const state = {
@@ -369,6 +375,9 @@
             lockedAddress: 'WAITING FOR GPS',
             latitude: 'Unavailable',
             longitude: 'Unavailable',
+            locationReading: null,
+            locationReady: false,
+            locationMessage: "Waiting for location.",
             gallery: [],
             activePreviewId: null
         };
@@ -477,65 +486,183 @@
             }
         }
 
-        // GEOLOCATION RESOLUTION
+        // Reported accuracy is an estimate, never proof of the employee's position.
+        // Deployment configuration can tighten these limits, never weaken defaults.
+        const locationConfig = window.TEHRA_LOCATION_CONFIG || {};
+        function secureLocationLimit(value, defaultLimit) {
+            return typeof value === 'number' && Number.isFinite(value) && value > 0
+                ? Math.min(value, defaultLimit) : defaultLimit;
+        }
+        const MAX_LOCATION_ACCURACY_METERS = secureLocationLimit(locationConfig.maxAccuracyMeters, 100);
+        const MAX_LOCATION_AGE_MS = secureLocationLimit(locationConfig.maxAgeMs, 60000);
+        const LOCATION_TIMEOUT_MS = 15000;
+        const LOCATION_PERMISSION_HELP = 'Allow location for this site in your browser and enable device Location Services. On iPhone/iPad enable Precise Location; on Android enable precise location for your browser. On Windows/macOS check location privacy settings. If this page is embedded, open it directly. Then tap Resync.';
         let locationRequestId = 0;
+        let geocodingController = null;
+        let locationTimeoutId = null;
+
+        function locationIsUsable() {
+            const reading = state.locationReading;
+            return document.visibilityState !== 'hidden' && state.locationReady && reading !== null &&
+                Number.isFinite(reading.accuracy) && reading.accuracy >= 0 &&
+                reading.accuracy <= MAX_LOCATION_ACCURACY_METERS &&
+                Date.now() >= reading.timestamp &&
+                Date.now() - reading.timestamp <= MAX_LOCATION_AGE_MS;
+        }
+
+        function updateLocationDetails() {
+            const reading = state.locationReading;
+            document.getElementById('boxAccuracy').textContent = reading && Number.isFinite(reading.accuracy) && reading.accuracy >= 0
+                ? `${reading.accuracy} m (reported estimate)` : 'Unavailable';
+            document.getElementById('boxLocationAge').textContent = reading && Number.isFinite(reading.timestamp)
+                ? (reading.timestamp <= Date.now() ? `${Math.floor((Date.now() - reading.timestamp) / 1000)} seconds` : 'Invalid timestamp') : 'Unavailable';
+            document.getElementById('locationStatus').textContent = reading && Date.now() - reading.timestamp > MAX_LOCATION_AGE_MS
+                ? 'Location reading is stale. Resync before capturing.' : state.locationMessage;
+        }
 
         function fetchLocation() {
             const requestId = ++locationRequestId;
-            updateGpsUI("LOCATING…", "Unavailable", "Unavailable");
+            clearTimeout(locationTimeoutId);
+            if (geocodingController) geocodingController.abort();
+            geocodingController = null;
+            state.locationReading = null;
+            state.locationReady = false;
+            state.locationMessage = 'Requesting a fresh device location…';
+            updateGpsUI('LOCATING…', 'Unavailable', 'Unavailable');
+            updateLocationDetails();
 
+            const fail = (message, address = 'GPS UNAVAILABLE — RETRY') => {
+                if (requestId !== locationRequestId) return;
+                state.locationReading = null;
+                state.locationReady = false;
+                state.locationMessage = message;
+                updateGpsUI(address, 'Unavailable', 'Unavailable');
+                updateLocationDetails();
+            };
+            if (window.isSecureContext === false) {
+                fail('Location requires a secure HTTPS connection. Open the HTTPS site directly.', 'GPS REQUIRES HTTPS');
+                return;
+            }
+            const policy = document.permissionsPolicy || document.featurePolicy;
+            if (policy && typeof policy.allowsFeature === 'function' && !policy.allowsFeature('geolocation')) {
+                fail('Location is blocked by this page’s embedding permissions. Open the site directly or contact your administrator.', 'GPS PERMISSION DENIED');
+                return;
+            }
             if (!navigator.geolocation) {
-                updateGpsUI("GPS NOT SUPPORTED", "Unavailable", "Unavailable");
+                fail('This browser does not support location detection.', 'GPS NOT SUPPORTED');
                 return;
             }
 
-            navigator.geolocation.getCurrentPosition(
-                async (pos) => {
+            // Some mobile browsers pause callbacks while hidden or awaiting permission.
+            // A bounded UI timeout also prevents a later callback reviving an expired request.
+            let settled = false;
+            locationTimeoutId = setTimeout(() => {
+                if (requestId !== locationRequestId || settled) return;
+                settled = true;
+                fail('Location request timed out. Keep this page open, check location permissions and services, then tap Resync.', 'GPS TIMED OUT — RETRY');
+            }, LOCATION_TIMEOUT_MS);
+            try {
+            navigator.geolocation.getCurrentPosition(async (pos) => {
+                if (requestId !== locationRequestId || settled) return;
+                settled = true;
+                clearTimeout(locationTimeoutId);
+                const { latitude: lat, longitude: lng, accuracy } = pos.coords;
+                if (!Number.isFinite(lat) || Math.abs(lat) > 90 || !Number.isFinite(lng) || Math.abs(lng) > 180) {
+                    fail('The browser returned invalid coordinates. Resync to retry.');
+                    return;
+                }
+                state.locationReading = { latitude: lat, longitude: lng, accuracy, timestamp: pos.timestamp };
+                const latFormatted = `${Math.abs(lat).toFixed(6)}° ${lat >= 0 ? 'N' : 'S'}`;
+                const lngFormatted = `${Math.abs(lng).toFixed(6)}° ${lng >= 0 ? 'E' : 'W'}`;
+                const coordinateAddress = `${latFormatted}, ${lngFormatted}`;
+                updateGpsUI(coordinateAddress, latFormatted, lngFormatted);
+                if (!Number.isFinite(pos.timestamp) || pos.timestamp > Date.now() || Date.now() - pos.timestamp > MAX_LOCATION_AGE_MS) {
+                    state.locationMessage = 'Location reading is stale or has an invalid timestamp. Resync before capturing.';
+                    updateLocationDetails();
+                    return;
+                }
+                if (!Number.isFinite(accuracy) || accuracy < 0 || accuracy > MAX_LOCATION_ACCURACY_METERS) {
+                    state.locationMessage = `Location accuracy is insufficient (${MAX_LOCATION_ACCURACY_METERS} m maximum). Device location may be approximate, especially on desktop. Enable precise location and improve GPS/Wi-Fi reception, then tap Resync. Capture is blocked.`;
+                    updateLocationDetails();
+                    return;
+                }
+                state.locationMessage = 'Looking up address… Device location may be approximate even when permission is enabled.';
+                updateLocationDetails();
+                const controller = new AbortController();
+                geocodingController = controller;
+                const timeoutId = setTimeout(() => controller.abort(), 8000);
+                try {
+                    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18`, {
+                        signal: controller.signal, cache: 'no-store'
+                    });
+                    if (!res.ok) throw new Error('Address service returned an error');
+                    const data = await res.json();
                     if (requestId !== locationRequestId) return;
-                    const lat = pos.coords.latitude;
-                    const lng = pos.coords.longitude;
-
-                    const latFormatted = `${Math.abs(lat).toFixed(6)}° ${lat >= 0 ? 'N' : 'S'}`;
-                    const lngFormatted = `${Math.abs(lng).toFixed(6)}° ${lng >= 0 ? 'E' : 'W'}`;
-                    const coordinateAddress = `${latFormatted}, ${lngFormatted}`;
-                    // Keep the real GPS fix visible even if address lookup fails.
+                    if (!data || data.error) throw new Error('No address found');
+                    const address = data.address || {};
+                    const parts = [address.road || address.pedestrian,
+                        address.suburb || address.neighbourhood || address.village,
+                        address.city || address.town || address.municipality || address.county,
+                        address.state || address.region, address.country]
+                        .filter(part => typeof part === 'string' && part.trim());
+                    const fullAddr = [...new Set(parts)].join(', ') ||
+                        (typeof data.display_name === 'string' ? data.display_name.trim() : '');
+                    if (!fullAddr) throw new Error('No address found');
+                    updateGpsUI(fullAddr.toUpperCase(), latFormatted, lngFormatted);
+                    state.locationReady = true;
+                    state.locationMessage = 'Address resolved. Accuracy is a browser estimate; device location may be approximate, especially on desktop.';
+                } catch (e) {
+                    if (requestId !== locationRequestId) return;
+                    state.locationReady = false;
+                    // Keep only the actual coordinates, never an old or invented address.
                     updateGpsUI(coordinateAddress, latFormatted, lngFormatted);
-
-                    const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 8000);
-                    try {
-                        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18`, {
-                            signal: controller.signal
-                        });
-                        if (!res.ok) return;
-                        const data = await res.json();
-                        if (requestId !== locationRequestId) return;
-                        const address = data.address || {};
-                        const road = address.road || address.pedestrian;
-                        const locality = address.suburb || address.neighbourhood || address.village;
-                        const city = address.city || address.town || address.municipality || address.county;
-                        const region = address.state || address.region;
-                        const parts = [road, locality, city, region, address.country]
-                            .filter(part => typeof part === 'string' && part.trim());
-                        const fullAddr = [...new Set(parts)].join(', ') ||
-                            (typeof data.display_name === 'string' ? data.display_name.trim() : '');
-                        if (fullAddr) updateGpsUI(fullAddr.toUpperCase(), latFormatted, lngFormatted);
-                    } catch (e) {
-                        // The GPS coordinates remain the location when no address is available.
-                        console.warn("Address lookup unavailable:", e);
-                    } finally {
-                        clearTimeout(timeoutId);
+                    state.locationMessage = controller.signal.aborted
+                        ? 'Reverse geocoding timed out. Address unavailable. Resync to retry.'
+                        : 'Reverse geocoding failed. Address unavailable. Check your connection and Resync.';
+                } finally {
+                    clearTimeout(timeoutId);
+                    if (requestId === locationRequestId) {
+                        geocodingController = null;
+                        updateLocationDetails();
                     }
-                },
-                (err) => {
-                    if (requestId !== locationRequestId) return;
-                    console.warn("Geolocation warning:", err);
-                    const message = err.code === 1 ? "GPS PERMISSION DENIED" :
-                        err.code === 3 ? "GPS TIMED OUT — RETRY" : "GPS UNAVAILABLE — RETRY";
-                    updateGpsUI(message, "Unavailable", "Unavailable");
-                },
-                { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
-            );
+                }
+            }, (err) => {
+                if (requestId !== locationRequestId || settled) return;
+                settled = true;
+                clearTimeout(locationTimeoutId);
+                const messages = {
+                    1: [`Location permission denied. ${LOCATION_PERMISSION_HELP}`, 'GPS PERMISSION DENIED'],
+                    2: ['Location unavailable. Check operating system location services and Wi-Fi, then Resync.', 'GPS UNAVAILABLE — RETRY'],
+                    3: ['Location request timed out. Check location services and Resync.', 'GPS TIMED OUT — RETRY']
+                };
+                const [message, address] = messages[err.code] || messages[2];
+                fail(message, address);
+            }, { enableHighAccuracy: true, maximumAge: 0, timeout: LOCATION_TIMEOUT_MS });
+            } catch (error) {
+                settled = true;
+                clearTimeout(locationTimeoutId);
+                fail(`Location could not be requested. ${LOCATION_PERMISSION_HELP}`);
+            }
+        }
+
+        function invalidateHiddenLocation() {
+            if (document.visibilityState !== 'hidden') {
+                updateLocationDetails();
+                return;
+            }
+            invalidateLocation();
+        }
+
+        function invalidateLocation() {
+            ++locationRequestId;
+            clearTimeout(locationTimeoutId);
+            if (geocodingController) geocodingController.abort();
+            geocodingController = null;
+            state.locationReady = false;
+            state.locationReading = null;
+            state.locationMessage = 'Page was backgrounded. Tap Resync for a fresh location before capturing.';
+            updateGpsUI('RESYNC REQUIRED', 'Unavailable', 'Unavailable');
+            updateLocationDetails();
         }
 
         function updateGpsUI(addr, lat, lng) {
@@ -668,6 +795,12 @@
         function capturePhoto() {
             if (!videoEl.videoWidth) {
                 showToast("Camera feed is not ready!", "error");
+                return;
+            }
+
+            if (!locationIsUsable()) {
+                updateLocationDetails();
+                showToast(`A location within ${MAX_LOCATION_ACCURACY_METERS} m accuracy, no older than ${MAX_LOCATION_AGE_MS / 1000} seconds, and a resolved address are required. Resync before capturing.`, "error");
                 return;
             }
 
@@ -833,9 +966,12 @@
 
         // EVENT BINDINGS
         window.addEventListener('DOMContentLoaded', () => {
+            document.addEventListener('visibilitychange', invalidateHiddenLocation);
+            window.addEventListener('pagehide', invalidateLocation);
+            window.addEventListener('pageshow', updateLocationDetails);
             initCamera();
             fetchLocation();
-            setInterval(updateDateTime, 1000);
+            setInterval(() => { updateDateTime(); updateLocationDetails(); }, 1000);
             updateDateTime();
             loadGalleryFromLocalStorage();
 

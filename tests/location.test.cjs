@@ -6,28 +6,31 @@ const vm = require('node:vm');
 const html = fs.readFileSync(require('node:path').join(__dirname, '../index.html'), 'utf8');
 const script = html.match(/<script>\s*\/\/ APP STATE([\s\S]*?)<\/script>/)[1];
 
-function app(fetchImpl = async () => ({ ok: false }), supported = true, fastTimeout = false) {
+function app(fetchImpl = async () => ({ ok: false }), supported = true, fastTimeout = false, config = {}) {
     const elements = new Map();
     const requests = [];
+    let watchdog;
     const context = vm.createContext({
         document: { getElementById(id) {
             if (!elements.has(id)) elements.set(id, { textContent: '' });
             return elements.get(id);
         } },
-        window: { addEventListener() {} },
+        window: { addEventListener() {}, TEHRA_LOCATION_CONFIG: config },
         navigator: supported ? { geolocation: { getCurrentPosition(success, failure, options) {
             requests.push({ success, failure, options });
         } } } : {},
         fetch: fetchImpl, AbortController,
-        setTimeout: fastTimeout ? (callback) => setTimeout(callback, 0) : setTimeout, clearTimeout,
+        setTimeout: (callback, ms) => ms === 15000 ? (watchdog = callback, 0) : setTimeout(callback, fastTimeout ? 0 : ms), clearTimeout,
         console: { warn() {} }
     });
     vm.runInContext(script, context);
     return {
         requests, elements,
+        timeout: () => watchdog(),
+        run: code => vm.runInContext(code, context),
         sync: () => vm.runInContext('fetchLocation()', context),
         state: () => vm.runInContext('({...state})', context),
-        fix: (index, latitude, longitude) => requests[index].success({ coords: { latitude, longitude } }),
+        fix: (index, latitude, longitude) => requests[index].success({ coords: { latitude, longitude, accuracy: 20 }, timestamp: Date.now() }),
         stamp() {
             const text = [];
             context.testCanvas = { save() {}, restore() {}, fillText(value) { text.push(value); } };
@@ -126,4 +129,123 @@ test('an old address response or GPS callback cannot overwrite a newer resync', 
     a.requests[0].failure({ code: 1 });
     await a.fix(0, 30, 40);
     assert.equal(a.state().lockedAddress, 'LOCATING…');
+});
+
+for (const accuracy of [101, 2000, undefined, NaN, -1]) {
+    test(`desktop reported accuracy ${accuracy} cannot authorize capture`, async () => {
+        let lookups = 0;
+        const a = app(async () => { lookups++; return { ok: true }; });
+        a.sync();
+        await a.requests[0].success({ coords: { latitude: 10, longitude: 20, accuracy }, timestamp: Date.now() });
+        assert.equal(a.run('locationIsUsable()'), false);
+        assert.equal(lookups, 0);
+        assert.match(a.elements.get('locationStatus').textContent, /Device location may be approximate/);
+        assert.equal(a.state().latitude, '10.000000° N');
+    });
+}
+
+for (const timestamp of [Date.now() - 120000, Date.now() + 120000, undefined, NaN]) {
+    test(`stale or invalid timestamp ${timestamp} cannot authorize capture`, async () => {
+        const a = app(); a.sync();
+        await a.requests[0].success({ coords: { latitude: 10, longitude: 20, accuracy: 10 }, timestamp });
+        assert.equal(a.run('locationIsUsable()'), false);
+        assert.match(a.elements.get('locationStatus').textContent, /stale|invalid timestamp/);
+    });
+}
+
+test('reading age advances and freshness is enforced at capture time', async () => {
+    const a = app(async () => ({ ok: true, json: async () => ({ display_name: 'Test address' }) }));
+    a.sync(); await a.fix(0, 10, 20);
+    assert.equal(a.run('locationIsUsable()'), true);
+    a.run('state.locationReading.timestamp = Date.now() - 61000; updateLocationDetails()');
+    assert.equal(a.run('locationIsUsable()'), false);
+    assert.match(a.elements.get('boxLocationAge').textContent, /61 seconds/);
+    assert.match(a.elements.get('locationStatus').textContent, /stale/);
+});
+
+test('repeated Resync aborts lookup and ignores late failure after newer success', async () => {
+    const pending = [];
+    const a = app((_url, options) => new Promise((resolve, reject) => pending.push({ resolve, reject, options })));
+    a.sync(); const first = a.fix(0, 10, 20);
+    a.sync(); const second = a.fix(1, 30, 40);
+    assert.equal(pending[0].options.signal.aborted, true);
+    assert.equal(a.requests[1].options.enableHighAccuracy, true);
+    assert.equal(a.requests[1].options.maximumAge, 0);
+    assert.equal(a.requests[1].options.timeout, 15000);
+    pending[1].resolve({ ok: true, json: async () => ({ display_name: 'New address' }) });
+    await second;
+    pending[0].reject(new Error('late failure')); await first;
+    a.requests[0].failure({ code: 3 });
+    assert.equal(a.state().lockedAddress, 'NEW ADDRESS');
+    assert.equal(a.run('locationIsUsable()'), true);
+});
+
+test('failed geocoding cannot authorize capture or retain a previous address', async () => {
+    let ok = true;
+    const a = app(async () => ({ ok, json: async () => ({ display_name: 'Previous address' }) }));
+    a.sync(); await a.fix(0, 10, 20);
+    ok = false; a.sync(); await a.fix(1, 30, 40);
+    assert(!a.state().lockedAddress.includes('Previous'));
+    assert.equal(a.run('locationIsUsable()'), false);
+    assert.match(a.elements.get('locationStatus').textContent, /Reverse geocoding failed/);
+});
+
+for (const config of [
+    { maxAccuracyMeters: 500, maxAgeMs: 300000 },
+    { maxAccuracyMeters: '200', maxAgeMs: '999999' },
+    { maxAccuracyMeters: -1, maxAgeMs: NaN },
+    { maxAccuracyMeters: Infinity, maxAgeMs: 0 }
+]) {
+    test(`unsafe deployment policy falls back to secure defaults: ${JSON.stringify(config)}`, () => {
+        const a = app(undefined, true, false, config);
+        assert.equal(a.run('MAX_LOCATION_ACCURACY_METERS'), 100);
+        assert.equal(a.run('MAX_LOCATION_AGE_MS'), 60000);
+    });
+}
+
+test('deployment policy can tighten both limits', async () => {
+    const a = app(async () => ({ ok: true, json: async () => ({ display_name: 'Fixture' }) }), true, false,
+        { maxAccuracyMeters: 10, maxAgeMs: 5000 });
+    a.sync(); await a.fix(0, 10, 20);
+    assert.equal(a.run('locationIsUsable()'), false);
+    assert.match(a.elements.get('locationStatus').textContent, /10 m maximum/);
+    a.sync(); await a.requests[1].success({ coords: { latitude: 10, longitude: 20, accuracy: 5 }, timestamp: Date.now() - 6000 });
+    assert.equal(a.run('locationIsUsable()'), false);
+});
+
+test('insecure context and embedding policy explain restrictions without requesting location', () => {
+    for (const setup of ['window.isSecureContext = false', 'document.permissionsPolicy = {allowsFeature: () => false}']) {
+        const a = app(); a.run(setup); a.sync();
+        assert.equal(a.requests.length, 0);
+        assert.equal(a.run('locationIsUsable()'), false);
+        assert.match(a.elements.get('locationStatus').textContent, /HTTPS|embedding/);
+    }
+});
+
+test('bounded timeout rejects late native callbacks and allows a new Resync', async () => {
+    const a = app(); a.sync(); a.timeout();
+    await a.fix(0, 10, 20);
+    assert.equal(a.state().latitude, 'Unavailable');
+    assert.match(a.elements.get('locationStatus').textContent, /timed out/);
+    a.sync(); await a.fix(1, 30, 40);
+    assert.equal(a.state().latitude, '30.000000° N');
+});
+
+test('backgrounding invalidates mobile readings and late callbacks', async () => {
+    const a = app(async () => ({ ok: true, json: async () => ({ display_name: 'Fixture' }) }));
+    a.sync(); await a.fix(0, 10, 20);
+    a.run("document.visibilityState = 'hidden'; invalidateHiddenLocation()");
+    assert.equal(a.run('locationIsUsable()'), false);
+    assert.equal(a.state().latitude, 'Unavailable');
+    await a.fix(0, 30, 40);
+    a.run("document.visibilityState = 'visible'; invalidateHiddenLocation()");
+    assert.equal(a.run('locationIsUsable()'), false);
+    assert.match(a.elements.get('locationStatus').textContent, /backgrounded/);
+});
+
+test('synchronous geolocation exception fails closed with permission guidance', () => {
+    const a = app();
+    a.run("navigator.geolocation.getCurrentPosition = () => { throw new Error('blocked') }");
+    a.sync(); assert.equal(a.run('locationIsUsable()'), false);
+    assert.match(a.elements.get('locationStatus').textContent, /iPhone\/iPad|Android/);
 });
