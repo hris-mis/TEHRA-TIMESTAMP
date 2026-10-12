@@ -50,18 +50,24 @@ requests. Safari inline muted camera video and the existing camera retry remain.
 
 Cross-browser automation covers native geolocation with synthetic readings,
 status/accuracy/age, approximate readings, repeated Resync, interleaved callbacks,
-permission/unavailable/timeout errors, stale positions, reverse-geocoding errors,
+permission/unavailable/timeout errors, future/stale positions, reverse-geocoding errors,
 and background invalidation. The existing Chromium camera suite covers required
 employee fields, JPEG timestamp capture, gallery, preview/download link and deletion.
 Firefox/WebKit location suites intentionally stub camera failure; they do not claim
 camera integration coverage. No synthetic coordinates are sent to a real geocoder.
 
-Local validation for this update: 34 Node regressions, Chromium desktop and Android
-viewport location profiles, and the original Chromium camera/features suite passed.
-Firefox and WebKit were unavailable; downloads were blocked by environment network
-policy. The suite prints explicit skips locally, fails if no engine runs, and CI
-sets `REQUIRE_ALL_BROWSERS=1` after installing all three engines. Firefox desktop/touch
-and WebKit desktop/iPhone profiles are configured but were not executed locally.
+Firefox's Playwright 1.56.1 geolocation override was observed to return a synthetic
+timestamp almost 24 hours ahead of the page clock. The application correctly rejects
+future timestamps, so the suite supplies a fresh callback-time timestamp for Firefox's
+synthetic readings while retaining native coordinates, permissions and request options.
+Chromium/WebKit timestamps are unchanged. Explicit future and stale timestamp fixtures
+test rejection in every engine; this adapter is test-only and does not change application
+freshness rules. Initialization failures print native timestamp and application diagnostics.
+
+CI installs Chromium, Firefox and WebKit and sets `REQUIRE_ALL_BROWSERS=1`, requiring
+all six desktop/mobile viewport profiles to execute. Firefox native device timestamp
+behavior and real-device GPS remain manual checks. If an engine is unavailable locally,
+the suite reports it explicitly; use `REQUIRE_ALL_BROWSERS=1` to fail rather than skip.
 
 Every browser/device combination below still requires real-device testing; engine
 and viewport emulation do not validate native permissions, OS providers or GPS:

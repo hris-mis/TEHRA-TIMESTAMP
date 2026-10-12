@@ -71,6 +71,7 @@ const profiles = {
                     assert.equal(await page.locator('#boxLatitude').textContent(), '10.000000° N');
                     assert.match(await page.locator('#boxAccuracy').textContent(), /15 m/);
                     assert.match(await page.locator('#boxLocationAge').textContent(), /seconds/);
+                    assert.equal(await page.evaluate(() => locationIsUsable()), true);
                     await context.setGeolocation({ latitude: -30, longitude: -40, accuracy: 2000 });
                     await page.locator('#btnResyncGps').click();
                     await page.waitForFunction(() => state.locationReading?.accuracy === 2000);
