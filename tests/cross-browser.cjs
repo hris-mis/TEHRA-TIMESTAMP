@@ -26,20 +26,25 @@ const profiles = {
                     geolocation: { latitude: 10, longitude: 20, accuracy: 15 } });
                 try {
                     const page = await context.newPage();
-                    await page.addInitScript(() => {
-                        // Observe native readings without replacing browser geolocation behavior.
+                    await page.addInitScript(({ engine }) => {
+                        // Keep native coordinates, permission handling and request options. The
+                        // Firefox automation override returns future-dated fixture timestamps
+                        // (about 24 hours ahead in Playwright 1.56.1), which the app must reject.
+                        // Supply a fresh test timestamp only for that engine's synthetic readings;
+                        // invalid/future/stale metadata is exercised separately below.
                         const getPosition = navigator.geolocation.getCurrentPosition.bind(navigator.geolocation);
                         window.nativeLocationReadings = [];
                         navigator.geolocation.getCurrentPosition = (success, failure, options) => getPosition(position => {
-                            nativeLocationReadings.push({ timestamp: position.timestamp, receivedAt: Date.now(),
+                            const receivedAt = Date.now();
+                            nativeLocationReadings.push({ timestamp: position.timestamp, receivedAt,
                                 accuracy: position.coords.accuracy });
-                            success(position);
+                            success(engine === 'firefox' ? { coords: position.coords, timestamp: receivedAt } : position);
                         }, failure, options);
                         // Camera is deliberately outside this location-engine suite.
                         Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {
                             value: async () => { throw new Error('Camera fixture unavailable'); }
                         });
-                    });
+                    }, { engine });
                     const errors = []; page.on('pageerror', e => errors.push(e.message));
                     let lookupFails = false;
                     await page.route('**/*', route => {
@@ -102,6 +107,12 @@ const profiles = {
                     assert.equal(await page.evaluate(() => locationIsUsable()), false);
                     assert(!await page.evaluate(() => state.lockedAddress.includes('Synthetic')));
                     lookupFails = false;
+                    // A future-dated position like Firefox's automation override must still
+                    // fail closed in the application, regardless of the engine running it.
+                    await page.evaluate(() => { fetchLocation(); fixtureRequests.at(-1).success({ coords: { latitude: 1, longitude: 2, accuracy: 5 }, timestamp: Date.now() + 86400000 }); });
+                    assert.equal(await page.evaluate(() => state.locationReady), false);
+                    assert.equal(await page.evaluate(() => locationIsUsable()), false);
+                    assert.match(await page.locator('#locationStatus').textContent(), /invalid timestamp/);
                     await page.evaluate(() => { fetchLocation(); fixtureRequests.at(-1).success({ coords: { latitude: 1, longitude: 2, accuracy: 5 }, timestamp: Date.now() - 120000 }); });
                     assert.equal(await page.evaluate(() => locationIsUsable()), false);
                     assert.match(await page.locator('#locationStatus').textContent(), /stale/);
@@ -112,7 +123,7 @@ const profiles = {
                     assert.equal(await page.locator('#boxLatitude').textContent(), 'Unavailable');
                     assert.equal(await page.evaluate(() => locationIsUsable()), false);
                     assert.deepEqual(errors, []);
-                    console.log(`PASS ${engine} ${profile.name}: native fresh Geolocation API, accuracy/age, repeated Resync, stale callbacks/readings, permission/timeout/unavailable errors, geocoding failures, background invalidation`);
+                    console.log(`PASS ${engine} ${profile.name}: native Geolocation API coordinates/permissions${engine === 'firefox' ? ' (fixture timestamp)' : ''}, accuracy/age, repeated Resync, stale callbacks/readings, future timestamp rejection, permission/timeout/unavailable errors, geocoding failures, background invalidation`);
                     passed++;
                 } finally { await context.close(); }
             }
