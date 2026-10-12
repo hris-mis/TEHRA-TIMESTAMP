@@ -30,15 +30,18 @@ const profiles = {
                         // Keep native coordinates, permission handling and request options. The
                         // Firefox automation override returns future-dated fixture timestamps
                         // (about 24 hours ahead in Playwright 1.56.1), which the app must reject.
-                        // Supply a fresh test timestamp only for that engine's synthetic readings;
-                        // invalid/future/stale metadata is exercised separately below.
+                        // WebKit's override supplies microseconds instead of epoch milliseconds.
+                        // Correct only synthetic fixture metadata; invalid/future/stale readings
+                        // are exercised separately below. Production guards remain unchanged.
                         const getPosition = navigator.geolocation.getCurrentPosition.bind(navigator.geolocation);
                         window.nativeLocationReadings = [];
                         navigator.geolocation.getCurrentPosition = (success, failure, options) => getPosition(position => {
                             const receivedAt = Date.now();
                             nativeLocationReadings.push({ timestamp: position.timestamp, receivedAt,
                                 accuracy: position.coords.accuracy });
-                            success(engine === 'firefox' ? { coords: position.coords, timestamp: receivedAt } : position);
+                            const timestamp = engine === 'firefox' ? receivedAt
+                                : engine === 'webkit' ? position.timestamp / 1000 : position.timestamp;
+                            success(engine === 'chromium' ? position : { coords: position.coords, timestamp });
                         }, failure, options);
                         // Camera is deliberately outside this location-engine suite.
                         Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {
@@ -124,7 +127,7 @@ const profiles = {
                     assert.equal(await page.locator('#boxLatitude').textContent(), 'Unavailable');
                     assert.equal(await page.evaluate(() => locationIsUsable()), false);
                     assert.deepEqual(errors, []);
-                    console.log(`PASS ${engine} ${profile.name}: native Geolocation API coordinates/permissions${engine === 'firefox' ? ' (fixture timestamp)' : ''}, accuracy/age, repeated Resync, stale callbacks/readings, future timestamp rejection, permission/timeout/unavailable errors, geocoding failures, background invalidation`);
+                    console.log(`PASS ${engine} ${profile.name}: native Geolocation API coordinates/permissions${engine !== 'chromium' ? ' (fixture timestamp)' : ''}, accuracy/age, repeated Resync, stale callbacks/readings, future timestamp rejection, permission/timeout/unavailable errors, geocoding failures, background invalidation`);
                     passed++;
                 } finally { await context.close(); }
             }

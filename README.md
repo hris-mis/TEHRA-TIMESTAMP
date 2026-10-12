@@ -60,12 +60,13 @@ Firefox's Playwright 1.56.1 geolocation override was observed to return a synthe
 timestamp almost 24 hours ahead of the page clock. The application correctly rejects
 future timestamps, so the suite supplies a fresh callback-time timestamp for Firefox's
 synthetic readings while retaining native coordinates, permissions and request options.
-Chromium/WebKit timestamps are unchanged. Explicit future and stale timestamp fixtures
+WebKit's override was observed to return epoch microseconds; the test converts these
+to epoch milliseconds. Chromium timestamps are unchanged. Explicit future and stale fixtures
 test rejection in every engine; this adapter is test-only and does not change application
 freshness rules. Initialization failures print native timestamp and application diagnostics.
 
 CI installs Chromium, Firefox and WebKit and sets `REQUIRE_ALL_BROWSERS=1`, requiring
-all six desktop/mobile viewport profiles to execute. Firefox native device timestamp
+all six desktop/mobile viewport profiles to execute. Firefox/WebKit native device timestamp
 behavior and real-device GPS remain manual checks. If an engine is unavailable locally,
 the suite reports it explicitly; use `REQUIRE_ALL_BROWSERS=1` to fail rather than skip.
 
