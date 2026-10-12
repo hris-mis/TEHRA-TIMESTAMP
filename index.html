@@ -180,7 +180,7 @@
                     <!-- Address -->
                     <div class="flex items-center space-x-2 mb-1">
                         <i class="fa-solid fa-location-dot text-rose-500 text-sm"></i>
-                        <span id="overlayAddress" class="font-extrabold text-white text-sm sm:text-base tracking-tight uppercase leading-tight">2ND STREET, PASIG, METRO MANILA</span>
+                        <span id="overlayAddress" class="font-extrabold text-white text-sm sm:text-base tracking-tight uppercase leading-tight">WAITING FOR GPS</span>
                     </div>
                     <!-- Date & Time -->
                     <div class="flex items-center space-x-2 text-emerald-400 font-mono text-xs sm:text-sm font-semibold mb-1">
@@ -190,7 +190,7 @@
                     <!-- Coordinates -->
                     <div class="flex items-center space-x-1.5 text-slate-300 font-mono text-[11px] sm:text-xs">
                         <i class="fa-solid fa-globe text-blue-400 text-xs"></i>
-                        <span id="overlayLatLng">LAT: 14.574921° N, LON: 121.058942° E</span>
+                        <span id="overlayLatLng">LAT: Unavailable, LON: Unavailable</span>
                     </div>
                 </div>
 
@@ -229,7 +229,7 @@
                 <div>
                     <label class="block text-[10px] uppercase tracking-wider font-bold text-slate-500 mb-1">LOCKED ADDRESS</label>
                     <div class="w-full bg-[#0B0F19] border border-slate-800 rounded-xl px-3.5 py-2.5 text-white font-bold text-xs sm:text-sm tracking-wide uppercase flex items-center justify-between">
-                        <span id="boxLockedAddress" class="truncate">2ND STREET, PASIG, METRO MANILA</span>
+                        <span id="boxLockedAddress" class="truncate">WAITING FOR GPS</span>
                         <i class="fa-solid fa-lock text-slate-600 text-xs ml-2"></i>
                     </div>
                 </div>
@@ -239,13 +239,13 @@
                     <div>
                         <label class="block text-[10px] uppercase tracking-wider font-bold text-slate-500 mb-1">LATITUDE</label>
                         <div id="boxLatitude" class="w-full bg-[#0B0F19] border border-slate-800 rounded-xl px-3 py-2 text-blue-400 font-mono font-bold text-xs sm:text-sm">
-                            14.574921° N
+                            Unavailable
                         </div>
                     </div>
                     <div>
                         <label class="block text-[10px] uppercase tracking-wider font-bold text-slate-500 mb-1">LONGITUDE</label>
                         <div id="boxLongitude" class="w-full bg-[#0B0F19] border border-slate-800 rounded-xl px-3 py-2 text-blue-400 font-mono font-bold text-xs sm:text-sm">
-                            121.058942° E
+                            Unavailable
                         </div>
                     </div>
                 </div>
@@ -366,9 +366,9 @@
             department: '',
             employeeName: '',
             employeeId: '',
-            lockedAddress: '2ND STREET, PASIG, METRO MANILA',
-            latitude: '14.574921° N',
-            longitude: '121.058942° E',
+            lockedAddress: 'WAITING FOR GPS',
+            latitude: 'Unavailable',
+            longitude: 'Unavailable',
             gallery: [],
             activePreviewId: null
         };
@@ -478,42 +478,63 @@
         }
 
         // GEOLOCATION RESOLUTION
+        let locationRequestId = 0;
+
         function fetchLocation() {
+            const requestId = ++locationRequestId;
+            updateGpsUI("LOCATING…", "Unavailable", "Unavailable");
+
             if (!navigator.geolocation) {
-                updateGpsUI("2ND STREET, PASIG, METRO MANILA", "14.574921° N", "121.058942° E");
+                updateGpsUI("GPS NOT SUPPORTED", "Unavailable", "Unavailable");
                 return;
             }
 
             navigator.geolocation.getCurrentPosition(
                 async (pos) => {
+                    if (requestId !== locationRequestId) return;
                     const lat = pos.coords.latitude;
                     const lng = pos.coords.longitude;
-                    
+
                     const latFormatted = `${Math.abs(lat).toFixed(6)}° ${lat >= 0 ? 'N' : 'S'}`;
                     const lngFormatted = `${Math.abs(lng).toFixed(6)}° ${lng >= 0 ? 'E' : 'W'}`;
+                    const coordinateAddress = `${latFormatted}, ${lngFormatted}`;
+                    // Keep the real GPS fix visible even if address lookup fails.
+                    updateGpsUI(coordinateAddress, latFormatted, lngFormatted);
 
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 8000);
                     try {
-                        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=16`);
-                        if (res.ok) {
-                            const data = await res.json();
-                            const road = data.address.road || data.address.pedestrian || data.address.suburb || "LOCALITY";
-                            const city = data.address.city || data.address.town || data.address.municipality || "PASIG";
-                            const stateName = data.address.state || data.address.region || "METRO MANILA";
-                            
-                            const fullAddr = `${road}, ${city}, ${stateName}`.toUpperCase();
-                            updateGpsUI(fullAddr, latFormatted, lngFormatted);
-                        } else {
-                            updateGpsUI("2ND STREET, PASIG, METRO MANILA", latFormatted, lngFormatted);
-                        }
+                        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18`, {
+                            signal: controller.signal
+                        });
+                        if (!res.ok) return;
+                        const data = await res.json();
+                        if (requestId !== locationRequestId) return;
+                        const address = data.address || {};
+                        const road = address.road || address.pedestrian;
+                        const locality = address.suburb || address.neighbourhood || address.village;
+                        const city = address.city || address.town || address.municipality || address.county;
+                        const region = address.state || address.region;
+                        const parts = [road, locality, city, region, address.country]
+                            .filter(part => typeof part === 'string' && part.trim());
+                        const fullAddr = [...new Set(parts)].join(', ') ||
+                            (typeof data.display_name === 'string' ? data.display_name.trim() : '');
+                        if (fullAddr) updateGpsUI(fullAddr.toUpperCase(), latFormatted, lngFormatted);
                     } catch (e) {
-                        updateGpsUI("2ND STREET, PASIG, METRO MANILA", latFormatted, lngFormatted);
+                        // The GPS coordinates remain the location when no address is available.
+                        console.warn("Address lookup unavailable:", e);
+                    } finally {
+                        clearTimeout(timeoutId);
                     }
                 },
                 (err) => {
+                    if (requestId !== locationRequestId) return;
                     console.warn("Geolocation warning:", err);
-                    updateGpsUI("2ND STREET, PASIG, METRO MANILA", "14.574921° N", "121.058942° E");
+                    const message = err.code === 1 ? "GPS PERMISSION DENIED" :
+                        err.code === 3 ? "GPS TIMED OUT — RETRY" : "GPS UNAVAILABLE — RETRY";
+                    updateGpsUI(message, "Unavailable", "Unavailable");
                 },
-                { enableHighAccuracy: true, timeout: 8000 }
+                { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
             );
         }
 
