@@ -20,6 +20,7 @@ const path = require('node:path');
             const url = route.request().url();
             if (url === 'http://localhost:8123/') return route.fulfill({ contentType: 'text/html',
                 body: fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8') });
+            if (url.endsWith('/location-config.js')) return route.fulfill({ body: fs.readFileSync(path.join(__dirname, '../location-config.js'), 'utf8') });
             if (url.includes('/reverse?')) return route.fulfill(geocodeFails
                 ? { status: 503, body: '' }
                 : { contentType: 'application/json', body: JSON.stringify({ display_name: 'Synthetic test address' }) });
@@ -40,7 +41,7 @@ const path = require('node:path');
         await page.waitForFunction(() => state.locationReading?.accuracy === 2000);
         await page.locator('#btnShutter').click();
         assert.equal(await page.evaluate(() => state.gallery.length), 1);
-        assert.match(await page.locator('#locationStatus').textContent(), /Desktop Chrome location may be approximate/);
+        assert.match(await page.locator('#locationStatus').textContent(), /Device location may be approximate/);
         await context.setGeolocation({ latitude: 30, longitude: 40, accuracy: 10 });
         await page.locator('#btnResyncGps').click();
         await page.locator('#btnResyncGps').click();
