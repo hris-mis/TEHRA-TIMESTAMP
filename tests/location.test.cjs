@@ -25,9 +25,10 @@ function app(fetchImpl = async () => ({ ok: false }), supported = true, fastTime
     vm.runInContext(script, context);
     return {
         requests, elements,
+        run: code => vm.runInContext(code, context),
         sync: () => vm.runInContext('fetchLocation()', context),
         state: () => vm.runInContext('({...state})', context),
-        fix: (index, latitude, longitude) => requests[index].success({ coords: { latitude, longitude } }),
+        fix: (index, latitude, longitude) => requests[index].success({ coords: { latitude, longitude, accuracy: 20 }, timestamp: Date.now() }),
         stamp() {
             const text = [];
             context.testCanvas = { save() {}, restore() {}, fillText(value) { text.push(value); } };
@@ -126,4 +127,63 @@ test('an old address response or GPS callback cannot overwrite a newer resync', 
     a.requests[0].failure({ code: 1 });
     await a.fix(0, 30, 40);
     assert.equal(a.state().lockedAddress, 'LOCATING…');
+});
+
+for (const accuracy of [101, 2000, undefined, NaN, -1]) {
+    test(`desktop reported accuracy ${accuracy} cannot authorize capture`, async () => {
+        let lookups = 0;
+        const a = app(async () => { lookups++; return { ok: true }; });
+        a.sync();
+        await a.requests[0].success({ coords: { latitude: 10, longitude: 20, accuracy }, timestamp: Date.now() });
+        assert.equal(a.run('locationIsUsable()'), false);
+        assert.equal(lookups, 0);
+        assert.match(a.elements.get('locationStatus').textContent, /Desktop Chrome location may be approximate/);
+        assert.equal(a.state().latitude, '10.000000° N');
+    });
+}
+
+for (const timestamp of [Date.now() - 120000, Date.now() + 120000, undefined, NaN]) {
+    test(`stale or invalid timestamp ${timestamp} cannot authorize capture`, async () => {
+        const a = app(); a.sync();
+        await a.requests[0].success({ coords: { latitude: 10, longitude: 20, accuracy: 10 }, timestamp });
+        assert.equal(a.run('locationIsUsable()'), false);
+        assert.match(a.elements.get('locationStatus').textContent, /stale|invalid timestamp/);
+    });
+}
+
+test('reading age advances and freshness is enforced at capture time', async () => {
+    const a = app(async () => ({ ok: true, json: async () => ({ display_name: 'Test address' }) }));
+    a.sync(); await a.fix(0, 10, 20);
+    assert.equal(a.run('locationIsUsable()'), true);
+    a.run('state.locationReading.timestamp = Date.now() - 61000; updateLocationDetails()');
+    assert.equal(a.run('locationIsUsable()'), false);
+    assert.match(a.elements.get('boxLocationAge').textContent, /61 seconds/);
+    assert.match(a.elements.get('locationStatus').textContent, /stale/);
+});
+
+test('repeated Resync aborts lookup and ignores late failure after newer success', async () => {
+    const pending = [];
+    const a = app((_url, options) => new Promise((resolve, reject) => pending.push({ resolve, reject, options })));
+    a.sync(); const first = a.fix(0, 10, 20);
+    a.sync(); const second = a.fix(1, 30, 40);
+    assert.equal(pending[0].options.signal.aborted, true);
+    assert.equal(a.requests[1].options.enableHighAccuracy, true);
+    assert.equal(a.requests[1].options.maximumAge, 0);
+    assert.equal(a.requests[1].options.timeout, 15000);
+    pending[1].resolve({ ok: true, json: async () => ({ display_name: 'New address' }) });
+    await second;
+    pending[0].reject(new Error('late failure')); await first;
+    a.requests[0].failure({ code: 3 });
+    assert.equal(a.state().lockedAddress, 'NEW ADDRESS');
+    assert.equal(a.run('locationIsUsable()'), true);
+});
+
+test('failed geocoding cannot authorize capture or retain a previous address', async () => {
+    let ok = true;
+    const a = app(async () => ({ ok, json: async () => ({ display_name: 'Previous address' }) }));
+    a.sync(); await a.fix(0, 10, 20);
+    ok = false; a.sync(); await a.fix(1, 30, 40);
+    assert(!a.state().lockedAddress.includes('Previous'));
+    assert.equal(a.run('locationIsUsable()'), false);
+    assert.match(a.elements.get('locationStatus').textContent, /Reverse geocoding failed/);
 });
