@@ -369,3 +369,79 @@ test('Resync during retry backoff cancels further obsolete lookups', async () =>
     assert.equal(a.state().lockedAddress, 'LOCATING…');
     assert.equal(a.run('locationIsUsable()'), false);
 });
+
+
+const safariUA = 'Mozilla/5.0 (iPhone) AppleWebKit/605.1.15 Version/18.0 Mobile Safari/604.1';
+const clock = 1791868000000;
+const epochOffset = 978307200000;
+const timestampEncodings = [
+    ['unix milliseconds', ms => ms],
+    ['unix seconds', ms => ms / 1000],
+    ['unix microseconds', ms => ms * 1000],
+    ['apple-2001 milliseconds', ms => ms - epochOffset],
+    ['apple-2001 seconds', ms => (ms - epochOffset) / 1000],
+    ['apple-2001 microseconds', ms => (ms - epochOffset) * 1000]
+];
+for (const [encoding, encode] of timestampEncodings) {
+    for (const age of [6000, 60000, 60001, -1]) {
+        test(`Safari ${encoding}: preserves ${age} ms age and capture gate`, async () => {
+            let lookups = 0;
+            const a = app(async () => {
+                lookups++;
+                return { ok: true, json: async () => ({ display_name: 'Synthetic regression address' }) };
+            });
+            a.run(`Date.now = () => ${clock}; navigator.userAgent = ${JSON.stringify(safariUA)}`);
+            a.sync();
+            const raw = encode(clock - age);
+            await a.requests[0].success({ coords: { latitude: 10, longitude: 20, accuracy: 35 }, timestamp: raw });
+            const reading = a.state().locationReading;
+            assert.equal(reading.rawTimestamp, raw);
+            assert.equal(reading.receivedAt, clock);
+            assert.equal(reading.timestamp, clock - age);
+            assert.equal(reading.timestampEncoding, encoding);
+            const valid = age >= 0 && age <= 60000;
+            assert.equal(lookups, valid ? 1 : 0);
+            assert.equal(a.run('locationIsUsable()'), valid);
+            if (!valid) {
+                a.run("videoEl.videoWidth = 640; showToast = () => {}; capturePhoto()");
+                assert.equal(a.state().gallery.length, 0);
+                assert.equal(a.state().lockedAddress, 'Address unavailable');
+            }
+        });
+    }
+}
+
+test('reported 978307206-second Safari age is exactly Apple epoch plus six seconds', async () => {
+    const raw = clock - epochOffset - 6000;
+    assert.equal(Math.floor((clock - raw) / 1000), 978307206);
+    const a = app(async () => ({ ok: true, json: async () => ({ display_name: 'Synthetic regression address' }) }));
+    a.run(`Date.now = () => ${clock}; navigator.userAgent = ${JSON.stringify(safariUA)}`);
+    for (let i = 0; i < 3; i++) {
+        a.sync();
+        await a.requests[i].success({ coords: { latitude: 10, longitude: 20, accuracy: 35 }, timestamp: raw });
+        assert.equal(a.elements.get('boxLocationAge').textContent, '6 seconds');
+        assert.equal(a.run('locationIsUsable()'), true);
+    }
+    a.run(`Date.now = () => ${clock + 54001}`);
+    assert.equal(a.run('locationIsUsable()'), false);
+});
+
+for (const raw of [undefined, null, NaN, Infinity, -1, 0, '1791868000000', 12345, clock * 1e6]) {
+    test(`unsupported Safari timestamp ${raw} never geocodes or captures`, async () => {
+        let lookups = 0;
+        const a = app(async () => { lookups++; return { ok: true }; });
+        a.run(`navigator.userAgent = ${JSON.stringify(safariUA)}`);
+        a.sync();
+        await a.requests[0].success({ coords: { latitude: 10, longitude: 20, accuracy: 35 }, timestamp: raw });
+        assert.equal(lookups, 0);
+        assert.equal(a.run('locationIsUsable()'), false);
+        a.run('videoEl.videoWidth = 640; showToast = () => {}; capturePhoto()');
+        assert.equal(a.state().gallery.length, 0);
+    });
+}
+
+test('Apple epoch conversion is provider-scoped and never salvages stale Unix readings', () => {
+    const a = app();
+    assert.equal(a.run(`normalizeLocationTimestamp(${clock - 120000}, ${JSON.stringify(safariUA)}).timestamp`), clock - 120000);
+    assert.equal(a.run(`Number.isNaN(normalizeLocationTimestamp(${clock - epochOffset}, 'Chrome/120 AppleWebKit').timestamp)`), true);
+});

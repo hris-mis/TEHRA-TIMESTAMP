@@ -502,6 +502,46 @@
         let geocodingController = null;
         let locationTimeoutId = null;
 
+        // The API specifies Unix milliseconds. Some WebKit providers expose
+        // Apple (2001-01-01) milliseconds (the reported age signature);
+        // automation may expose microseconds. Real-device confirmation is required.
+        // Decode by fixed magnitude and provider, never by choosing the freshest
+        // candidate or replacing the reported timestamp with callback time.
+        const APPLE_EPOCH_OFFSET_MS = 978307200000;
+        function normalizeLocationTimestamp(raw, userAgent = navigator.userAgent || '') {
+            if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) {
+                return { timestamp: NaN, encoding: 'invalid' };
+            }
+            let timestamp;
+            let unit;
+            if (raw >= 1e14 && raw < 1e16) {
+                timestamp = raw / 1000;
+                unit = 'microseconds';
+            } else if (raw >= 1e11 && raw < 1e13) {
+                timestamp = raw;
+                unit = 'milliseconds';
+            } else if (raw >= 1e8 && raw < 1e10) {
+                timestamp = raw * 1000;
+                unit = 'seconds';
+            } else {
+                return { timestamp: NaN, encoding: 'unsupported' };
+            }
+            const webkitProvider = /AppleWebKit/i.test(userAgent) &&
+                !/Chrome\/|Chromium\/|Edg\/|OPR\//i.test(userAgent);
+            if (timestamp < APPLE_EPOCH_OFFSET_MS) {
+                if (!webkitProvider) return { timestamp: NaN, encoding: 'unsupported epoch' };
+                timestamp += APPLE_EPOCH_OFFSET_MS;
+                return { timestamp, encoding: `apple-2001 ${unit}` };
+            }
+            return { timestamp, encoding: `unix ${unit}` };
+        }
+
+        function locationReadingIsFresh(reading, now = Date.now()) {
+            return reading !== null && Number.isFinite(reading.timestamp) &&
+                Number.isFinite(now) && reading.timestamp <= now &&
+                now - reading.timestamp <= MAX_LOCATION_AGE_MS;
+        }
+
         function locationIsUsable() {
             const reading = state.locationReading;
             return document.visibilityState !== 'hidden' && state.locationReady && reading !== null &&
@@ -510,17 +550,17 @@
                 Number.isFinite(reading.longitude) && Math.abs(reading.longitude) <= 180 &&
                 Number.isFinite(reading.accuracy) && reading.accuracy >= 0 &&
                 reading.accuracy <= MAX_LOCATION_ACCURACY_METERS &&
-                Date.now() >= reading.timestamp &&
-                Date.now() - reading.timestamp <= MAX_LOCATION_AGE_MS;
+                locationReadingIsFresh(reading);
         }
 
         function updateLocationDetails() {
             const reading = state.locationReading;
+            const now = Date.now();
             document.getElementById('boxAccuracy').textContent = reading && Number.isFinite(reading.accuracy) && reading.accuracy >= 0
                 ? `${reading.accuracy} m (reported estimate)` : 'Unavailable';
             document.getElementById('boxLocationAge').textContent = reading && Number.isFinite(reading.timestamp)
-                ? (reading.timestamp <= Date.now() ? `${Math.floor((Date.now() - reading.timestamp) / 1000)} seconds` : 'Invalid timestamp') : 'Unavailable';
-            document.getElementById('locationStatus').textContent = reading && Date.now() - reading.timestamp > MAX_LOCATION_AGE_MS
+                ? (reading.timestamp <= now ? `${Math.floor((now - reading.timestamp) / 1000)} seconds` : 'Invalid timestamp') : 'Unavailable';
+            document.getElementById('locationStatus').textContent = reading && now - reading.timestamp > MAX_LOCATION_AGE_MS
                 ? 'Location reading is stale. Resync before capturing.' : state.locationMessage;
         }
 
@@ -575,11 +615,18 @@
                     fail('The browser returned invalid coordinates. Resync to retry.');
                     return;
                 }
-                state.locationReading = { latitude: lat, longitude: lng, accuracy, timestamp: pos.timestamp };
+                const receivedAt = Date.now();
+                const normalized = normalizeLocationTimestamp(pos.timestamp);
+                state.locationReading = { latitude: lat, longitude: lng, accuracy,
+                    rawTimestamp: pos.timestamp, receivedAt, timestamp: normalized.timestamp,
+                    timestampEncoding: normalized.encoding };
+                // Inspect state.locationReading in Safari's console to compare the
+                // provider value, page clock, normalized value and preserved age.
+
                 const latFormatted = `${Math.abs(lat).toFixed(6)}° ${lat >= 0 ? 'N' : 'S'}`;
                 const lngFormatted = `${Math.abs(lng).toFixed(6)}° ${lng >= 0 ? 'E' : 'W'}`;
                 updateGpsUI('Address unavailable', latFormatted, lngFormatted);
-                if (!Number.isFinite(pos.timestamp) || pos.timestamp > Date.now() || Date.now() - pos.timestamp > MAX_LOCATION_AGE_MS) {
+                if (!locationReadingIsFresh(state.locationReading, receivedAt)) {
                     state.locationMessage = 'Location reading is stale or has an invalid timestamp. Resync before capturing.';
                     updateLocationDetails();
                     return;
@@ -645,8 +692,7 @@
                         error.permanent = true;
                         throw error;
                     }
-                    if (document.visibilityState === 'hidden' || !Number.isFinite(reading.timestamp) ||
-                        reading.timestamp > Date.now() || Date.now() - reading.timestamp > MAX_LOCATION_AGE_MS) {
+                    if (document.visibilityState === 'hidden' || !locationReadingIsFresh(reading)) {
                         state.locationMessage = 'Location reading is stale or unavailable. Resync before capturing.';
                         return;
                     }
@@ -658,7 +704,7 @@
                 } catch (error) {
                     if (!current()) return;
                     updateGpsUI('Address unavailable', latFormatted, lngFormatted);
-                    retry = !error.permanent && attempt < 2 && Date.now() - reading.timestamp <= MAX_LOCATION_AGE_MS;
+                    retry = !error.permanent && attempt < 2 && locationReadingIsFresh(reading);
                     state.locationMessage = retry
                         ? `Reverse geocoding failed. Retrying address lookup (${attempt + 2}/3)…`
                         : 'Reverse geocoding failed. Address unavailable. Check your connection and Resync.';

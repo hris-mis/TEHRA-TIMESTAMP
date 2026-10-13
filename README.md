@@ -69,10 +69,38 @@ Firefox's Playwright 1.56.1 geolocation override was observed to return a synthe
 timestamp almost 24 hours ahead of the page clock. The application correctly rejects
 future timestamps, so the suite supplies a fresh callback-time timestamp for Firefox's
 synthetic readings while retaining native coordinates, permissions and request options.
-WebKit's override was observed to return epoch microseconds; the test converts these
-to epoch milliseconds. Chromium timestamps are unchanged. Explicit future and stale fixtures
-test rejection in every engine; this adapter is test-only and does not change application
-freshness rules. Initialization failures print native timestamp and application diagnostics.
+WebKit's override was observed to return epoch microseconds; it now reaches the
+application unchanged so production normalization is tested. Chromium timestamps
+are unchanged. Explicit future and stale fixtures test rejection in every engine.
+Initialization and successful acquisition print raw/native and normalized diagnostics.
+
+Timestamp decoding accepts positive finite numeric seconds, milliseconds and
+microseconds in fixed magnitude ranges. WebKit provider values before the Unix
+2001 epoch boundary receive the fixed Apple 2001 epoch offset (978307200000 ms).
+Current Unix values are never shifted. This is encoding conversion, not a freshness
+fallback: no closest-to-now candidate, clamping, or callback-time substitution occurs.
+Future, stale, unsupported and malformed values remain blocked; freshness is checked
+at acquisition, address completion, retry and capture using one shared predicate.
+`state.locationReading` retains `rawTimestamp`, `receivedAt`, normalized `timestamp`
+and `timestampEncoding` for Safari console inspection without transmitting diagnostics.
+
+The reported 978307206-second age equals the Unix/Apple epoch difference plus a
+six-second reading age. Main previously had no normalization and rejected this value
+before sending any reverse-geocoding request. This reproduces the report exactly,
+but the affected device's raw callback has not been observed here. Browser identity
+and magnitude do not prove an epoch: an ancient Unix timestamp can overlap an Apple
+value. The compatibility rule is scoped to WebKit providers (excluding desktop
+Chromium/Edge/Opera) and the nonoverlapping modern Unix range. It is not location
+attestation. Apple-relative milliseconds reach that boundary on 2032-01-02; this
+rule deliberately does not guess across it and must be revisited with provider
+metadata/real-device evidence. Nanoseconds and monotonic clock values are unsupported.
+
+For real Safari verification, inspect `state.locationReading` after each Resync:
+compare `rawTimestamp` with `receivedAt` and `Date.now()`, record `timestampEncoding`,
+and verify `(Date.now() - timestamp) / 1000` reflects actual age. Test after waiting
+61 seconds, in the background, with denied permission, accuracy above 100 m and
+failed address lookup. Capture must stay blocked in each invalid case. Do not publish
+employee coordinates or addresses when sharing console evidence.
 
 CI installs Chromium, Firefox and WebKit and sets `REQUIRE_ALL_BROWSERS=1`, requiring
 all six desktop/mobile viewport profiles to execute. Firefox/WebKit native device timestamp
@@ -97,3 +125,4 @@ validation, timestamp overlay and exported JPEG, gallery persistence, actual JPE
 download/save behavior (including iOS), preview and deletion. iOS browser branding
 is not proof of the installed engine; test each listed app directly. Branded Edge
 and Samsung Internet are not exercised by bundled Chromium automation.
+
