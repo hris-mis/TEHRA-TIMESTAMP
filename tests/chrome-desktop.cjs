@@ -61,11 +61,38 @@ const path = require('node:path');
         await page.waitForFunction(() => state.locationReady);
         assert.equal(await page.evaluate(() => locationIsUsable()), true);
         assert.equal(await page.locator('#boxLatitude').textContent(), '30.000000° N');
+        // Safari's epoch defect must not bypass the real shutter guard.
+        await page.evaluate(() => {
+            window.originalGetPosition = navigator.geolocation.getCurrentPosition.bind(navigator.geolocation);
+            Object.defineProperty(navigator, 'userAgent', { configurable: true,
+                value: 'AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15' });
+            navigator.geolocation.getCurrentPosition = success => {
+                success({ coords: { latitude: 30, longitude: 40, accuracy: 35 },
+                    timestamp: Date.now() - 978307200000 - 6000 });
+            };
+        });
+        await page.locator('#btnResyncGps').click();
+        await page.waitForFunction(() => state.locationReady);
+        assert.equal(await page.evaluate(() => locationIsUsable()), true);
+        assert.match(await page.locator('#boxLocationAge').textContent(), /^6 seconds$/);
+        for (const age of [61000, -120000]) {
+            await page.evaluate(age => {
+                navigator.geolocation.getCurrentPosition = success => success({
+                    coords: { latitude: 30, longitude: 40, accuracy: 35 },
+                    timestamp: Date.now() - 978307200000 - age
+                });
+            }, age);
+            await page.locator('#btnResyncGps').click();
+            await page.locator('#btnShutter').click();
+            assert.equal(await page.evaluate(() => state.gallery.length), 1);
+            assert.equal(await page.evaluate(() => locationIsUsable()), false);
+        }
         await page.locator('#btnOpenGallery').click();
         await page.locator('#galleryGrid img').click();
         assert((await page.locator('#btnDownloadCurrent').getAttribute('download')).startsWith('HRIS_Selfie_TEST001_'));
         await page.locator('#btnDeleteCurrent').click();
         assert.equal(await page.evaluate(() => state.gallery.length), 0);
+        await page.evaluate(() => { navigator.geolocation.getCurrentPosition = originalGetPosition; });
         await context.clearPermissions();
         await page.locator('#btnResyncGps').click();
         await page.waitForFunction(() => state.locationMessage.includes('permission denied'));
@@ -75,3 +102,4 @@ const path = require('node:path');
         console.log('PASS: Chromium desktop permissions, accuracy, repeated Resync, stale capture guard, geocoding failure, mandatory fields, JPEG, gallery, preview/download and deletion. All locations/addresses are test fixtures.');
     } finally { await browser.close(); }
 })().catch(e => { console.error(e); process.exitCode = 1; });
+

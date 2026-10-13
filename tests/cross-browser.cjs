@@ -27,21 +27,16 @@ const profiles = {
                 try {
                     const page = await context.newPage();
                     await page.addInitScript(({ engine }) => {
-                        // Keep native coordinates, permission handling and request options. The
-                        // Firefox automation override returns future-dated fixture timestamps
-                        // (about 24 hours ahead in Playwright 1.56.1), which the app must reject.
-                        // WebKit's override supplies microseconds instead of epoch milliseconds.
-                        // Correct only synthetic fixture metadata; invalid/future/stale readings
-                        // are exercised separately below. Production guards remain unchanged.
+                        // Record raw engine timestamps. Only Firefox's known synthetic
+                        // future override is adapted; WebKit reaches production unchanged.
                         const getPosition = navigator.geolocation.getCurrentPosition.bind(navigator.geolocation);
                         window.nativeLocationReadings = [];
                         navigator.geolocation.getCurrentPosition = (success, failure, options) => getPosition(position => {
                             const receivedAt = Date.now();
                             nativeLocationReadings.push({ timestamp: position.timestamp, receivedAt,
                                 accuracy: position.coords.accuracy });
-                            const timestamp = engine === 'firefox' ? receivedAt
-                                : engine === 'webkit' ? position.timestamp / 1000 : position.timestamp;
-                            success(engine === 'chromium' ? position : { coords: position.coords, timestamp });
+                            const timestamp = engine === 'firefox' ? receivedAt : position.timestamp;
+                            success(engine === 'firefox' ? { coords: position.coords, timestamp } : position);
                         }, failure, options);
                         // Camera is deliberately outside this location-engine suite.
                         Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {
@@ -75,6 +70,11 @@ const profiles = {
                     assert.match(await page.locator('#boxAccuracy').textContent(), /15 m/);
                     assert.match(await page.locator('#boxLocationAge').textContent(), /seconds/);
                     assert.equal(await page.evaluate(() => locationIsUsable()), true);
+                    console.log(`${engine} ${profile.name} raw/normalized`, await page.evaluate(() => ({
+                        native: nativeLocationReadings.at(-1), rawTimestamp: state.locationReading.rawTimestamp,
+                        receivedAt: state.locationReading.receivedAt, normalized: state.locationReading.timestamp,
+                        encoding: state.locationReading.timestampEncoding
+                    })));
                     await context.setGeolocation({ latitude: -30, longitude: -40, accuracy: 2000 });
                     await page.locator('#btnResyncGps').click();
                     await page.waitForFunction(() => state.locationReading?.accuracy === 2000);
@@ -105,6 +105,31 @@ const profiles = {
                         assert.equal(await page.evaluate(() => locationIsUsable()), false);
                         assert.equal(await page.locator('#boxLatitude').textContent(), 'Unavailable');
                     }
+                    // Feed unmodified synthetic Safari provider timestamps into production.
+                    // This verifies conversion in every engine; it is not native-device evidence.
+                    for (const format of ['apple-ms', 'unix-us', 'unix-s']) {
+                        await page.evaluate(format => {
+                            const now = Date.now();
+                            const raw = format === 'apple-ms' ? now - 978307200000 - 6000
+                                : format === 'unix-us' ? (now - 6000) * 1000 : (now - 6000) / 1000;
+                            Object.defineProperty(navigator, 'userAgent', { configurable: true,
+                                value: 'AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15' });
+                            fetchLocation();
+                            fixtureRequests.at(-1).success({ coords: { latitude: 1, longitude: 2, accuracy: 35 }, timestamp: raw });
+                        }, format);
+                        await page.waitForFunction(() => state.locationReady);
+                        assert.equal(await page.evaluate(() => locationIsUsable()), true);
+                        assert.match(await page.locator('#boxLocationAge').textContent(), /^6 seconds$/);
+                    }
+                    for (const age of [61000, -120000]) {
+                        await page.evaluate(age => {
+                            fetchLocation();
+                            fixtureRequests.at(-1).success({ coords: { latitude: 1, longitude: 2, accuracy: 35 },
+                                timestamp: Date.now() - 978307200000 - age });
+                        }, age);
+                        assert.equal(await page.evaluate(() => locationIsUsable()), false);
+                        assert.equal(await page.evaluate(() => state.locationReady), false);
+                    }
                     lookupFails = true;
                     await page.evaluate(() => { fetchLocation(); fixtureRequests.at(-1).success({ coords: { latitude: 1, longitude: 2, accuracy: 5 }, timestamp: Date.now() }); });
                     await page.waitForFunction(() => state.locationMessage.includes('Reverse geocoding failed') && !state.locationMessage.includes('Retrying'));
@@ -127,7 +152,7 @@ const profiles = {
                     assert.equal(await page.locator('#boxLatitude').textContent(), 'Unavailable');
                     assert.equal(await page.evaluate(() => locationIsUsable()), false);
                     assert.deepEqual(errors, []);
-                    console.log(`PASS ${engine} ${profile.name}: native Geolocation API coordinates/permissions${engine !== 'chromium' ? ' (fixture timestamp)' : ''}, accuracy/age, repeated Resync, stale callbacks/readings, future timestamp rejection, permission/timeout/unavailable errors, geocoding failures, background invalidation`);
+                    console.log(`PASS ${engine} ${profile.name}: native Geolocation API coordinates/permissions${engine === 'firefox' ? ' (fixture timestamp)' : ''}, accuracy/age, repeated Resync, stale callbacks/readings, future timestamp rejection, permission/timeout/unavailable errors, geocoding failures, background invalidation`);
                     passed++;
                 } finally { await context.close(); }
             }
@@ -136,3 +161,4 @@ const profiles = {
     if (!passed) throw new Error('No browser profile executed');
     console.log(`${passed} browser profiles passed. Viewport emulation and fixtures do not validate real-device GPS or native permission dialogs.`);
 })().catch(e => { console.error(e); process.exitCode = 1; });
+
