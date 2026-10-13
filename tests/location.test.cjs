@@ -360,7 +360,8 @@ test('Resync during retry backoff cancels further obsolete lookups', async () =>
     const urls = [];
     const a = app(async url => { urls.push(url); return { ok: false, status: 503 }; });
     a.sync(); const old = a.fix(0, 10, 20);
-    await Promise.resolve(); await Promise.resolve();
+    // Drain the cross-realm promise callbacks before the backoff timer fires.
+    for (let i = 0; i < 10 && !a.state().locationMessage.includes('Retrying'); i++) await Promise.resolve();
     assert.match(a.state().locationMessage, /Retrying/);
     a.sync();
     await old;
