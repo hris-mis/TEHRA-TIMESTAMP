@@ -377,6 +377,7 @@
             longitude: 'Unavailable',
             locationReading: null,
             locationReady: false,
+            resolvedLocationReading: null,
             locationMessage: "Waiting for location.",
             gallery: [],
             activePreviewId: null
@@ -504,6 +505,9 @@
         function locationIsUsable() {
             const reading = state.locationReading;
             return document.visibilityState !== 'hidden' && state.locationReady && reading !== null &&
+                state.resolvedLocationReading === reading &&
+                Number.isFinite(reading.latitude) && Math.abs(reading.latitude) <= 90 &&
+                Number.isFinite(reading.longitude) && Math.abs(reading.longitude) <= 180 &&
                 Number.isFinite(reading.accuracy) && reading.accuracy >= 0 &&
                 reading.accuracy <= MAX_LOCATION_ACCURACY_METERS &&
                 Date.now() >= reading.timestamp &&
@@ -574,8 +578,7 @@
                 state.locationReading = { latitude: lat, longitude: lng, accuracy, timestamp: pos.timestamp };
                 const latFormatted = `${Math.abs(lat).toFixed(6)}° ${lat >= 0 ? 'N' : 'S'}`;
                 const lngFormatted = `${Math.abs(lng).toFixed(6)}° ${lng >= 0 ? 'E' : 'W'}`;
-                const coordinateAddress = `${latFormatted}, ${lngFormatted}`;
-                updateGpsUI(coordinateAddress, latFormatted, lngFormatted);
+                updateGpsUI('Address unavailable', latFormatted, lngFormatted);
                 if (!Number.isFinite(pos.timestamp) || pos.timestamp > Date.now() || Date.now() - pos.timestamp > MAX_LOCATION_AGE_MS) {
                     state.locationMessage = 'Location reading is stale or has an invalid timestamp. Resync before capturing.';
                     updateLocationDetails();
@@ -588,44 +591,7 @@
                 }
                 state.locationMessage = 'Looking up address… Device location may be approximate even when permission is enabled.';
                 updateLocationDetails();
-                const controller = new AbortController();
-                geocodingController = controller;
-                const timeoutId = setTimeout(() => controller.abort(), 8000);
-                try {
-                    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18`, {
-                        signal: controller.signal, cache: 'no-store'
-                    });
-                    if (!res.ok) throw new Error('Address service returned an error');
-                    const data = await res.json();
-                    if (requestId !== locationRequestId) return;
-                    if (!data || data.error) throw new Error('No address found');
-                    const address = data.address || {};
-                    const parts = [address.road || address.pedestrian,
-                        address.suburb || address.neighbourhood || address.village,
-                        address.city || address.town || address.municipality || address.county,
-                        address.state || address.region, address.country]
-                        .filter(part => typeof part === 'string' && part.trim());
-                    const fullAddr = [...new Set(parts)].join(', ') ||
-                        (typeof data.display_name === 'string' ? data.display_name.trim() : '');
-                    if (!fullAddr) throw new Error('No address found');
-                    updateGpsUI(fullAddr.toUpperCase(), latFormatted, lngFormatted);
-                    state.locationReady = true;
-                    state.locationMessage = 'Address resolved. Accuracy is a browser estimate; device location may be approximate, especially on desktop.';
-                } catch (e) {
-                    if (requestId !== locationRequestId) return;
-                    state.locationReady = false;
-                    // Keep only the actual coordinates, never an old or invented address.
-                    updateGpsUI(coordinateAddress, latFormatted, lngFormatted);
-                    state.locationMessage = controller.signal.aborted
-                        ? 'Reverse geocoding timed out. Address unavailable. Resync to retry.'
-                        : 'Reverse geocoding failed. Address unavailable. Check your connection and Resync.';
-                } finally {
-                    clearTimeout(timeoutId);
-                    if (requestId === locationRequestId) {
-                        geocodingController = null;
-                        updateLocationDetails();
-                    }
-                }
+                await resolveAddress(requestId, state.locationReading, latFormatted, lngFormatted);
             }, (err) => {
                 if (requestId !== locationRequestId || settled) return;
                 settled = true;
@@ -642,6 +608,70 @@
                 settled = true;
                 clearTimeout(locationTimeoutId);
                 fail(`Location could not be requested. ${LOCATION_PERMISSION_HELP}`);
+            }
+        }
+
+        // Each attempt is bounded; only transient failures receive automatic retries.
+        async function resolveAddress(requestId, reading, latFormatted, lngFormatted) {
+            const current = () => requestId === locationRequestId && state.locationReading === reading;
+            for (let attempt = 0; attempt < 3 && current(); attempt++) {
+                const controller = new AbortController();
+                geocodingController = controller;
+                const timeoutId = setTimeout(() => controller.abort(), 8000);
+                let retry = false;
+                try {
+                    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${reading.latitude}&lon=${reading.longitude}&zoom=18`, {
+                        signal: controller.signal, cache: 'no-store'
+                    });
+                    if (!res.ok) {
+                        const error = new Error('Address service returned an error');
+                        error.permanent = !(res.status === 408 || res.status === 429 || res.status >= 500);
+                        throw error;
+                    }
+                    const data = await res.json();
+                    if (!current()) return;
+                    // An aborted request can still finish if a transport ignores cancellation.
+                    if (controller.signal.aborted) throw new Error('Address lookup timed out');
+                    const address = data && !data.error ? data.address || {} : {};
+                    const parts = [address.road || address.pedestrian,
+                        address.suburb || address.neighbourhood || address.village,
+                        address.city || address.town || address.municipality || address.county,
+                        address.state || address.region, address.country]
+                        .filter(part => typeof part === 'string' && part.trim()).map(part => part.trim());
+                    const fullAddr = [...new Set(parts)].join(', ') ||
+                        (data && !data.error && typeof data.display_name === 'string' ? data.display_name.trim() : '');
+                    if (!fullAddr) {
+                        const error = new Error('No address found');
+                        error.permanent = true;
+                        throw error;
+                    }
+                    if (document.visibilityState === 'hidden' || !Number.isFinite(reading.timestamp) ||
+                        reading.timestamp > Date.now() || Date.now() - reading.timestamp > MAX_LOCATION_AGE_MS) {
+                        state.locationMessage = 'Location reading is stale or unavailable. Resync before capturing.';
+                        return;
+                    }
+                    updateGpsUI(fullAddr.toUpperCase(), latFormatted, lngFormatted);
+                    state.resolvedLocationReading = reading;
+                    state.locationReady = true;
+                    state.locationMessage = 'Address resolved. Accuracy is a browser estimate; device location may be approximate, especially on desktop.';
+                    return;
+                } catch (error) {
+                    if (!current()) return;
+                    updateGpsUI('Address unavailable', latFormatted, lngFormatted);
+                    retry = !error.permanent && attempt < 2 && Date.now() - reading.timestamp <= MAX_LOCATION_AGE_MS;
+                    state.locationMessage = retry
+                        ? `Reverse geocoding failed. Retrying address lookup (${attempt + 2}/3)…`
+                        : 'Reverse geocoding failed. Address unavailable. Check your connection and Resync.';
+                } finally {
+                    clearTimeout(timeoutId);
+                    if (current()) {
+                        geocodingController = null;
+                        updateLocationDetails();
+                    }
+                }
+                if (!retry) return;
+                // Backoff keeps transient retries bounded and avoids a burst of requests.
+                await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
             }
         }
 
@@ -666,6 +696,9 @@
         }
 
         function updateGpsUI(addr, lat, lng) {
+            // Rendering a label never grants capture eligibility. Only lookup success does.
+            state.locationReady = false;
+            state.resolvedLocationReading = null;
             state.lockedAddress = addr;
             state.latitude = lat;
             state.longitude = lng;

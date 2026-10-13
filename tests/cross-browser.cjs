@@ -107,9 +107,9 @@ const profiles = {
                     }
                     lookupFails = true;
                     await page.evaluate(() => { fetchLocation(); fixtureRequests.at(-1).success({ coords: { latitude: 1, longitude: 2, accuracy: 5 }, timestamp: Date.now() }); });
-                    await page.waitForFunction(() => state.locationMessage.includes('Reverse geocoding failed'));
+                    await page.waitForFunction(() => state.locationMessage.includes('Reverse geocoding failed') && !state.locationMessage.includes('Retrying'));
                     assert.equal(await page.evaluate(() => locationIsUsable()), false);
-                    assert(!await page.evaluate(() => state.lockedAddress.includes('Synthetic')));
+                    assert.equal(await page.locator('#boxLockedAddress').textContent(), 'Address unavailable');
                     lookupFails = false;
                     // A future-dated position like Firefox's automation override must still
                     // fail closed in the application, regardless of the engine running it.

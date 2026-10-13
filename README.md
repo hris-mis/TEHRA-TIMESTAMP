@@ -6,6 +6,15 @@ permission and high accuracy enabled. The standard Geolocation API is used witho
 requiring the Permissions API (which is inconsistent across Safari/mobile browsers). The application cannot guarantee physical
 position from an API success or a reverse-geocoded address.
 
+No static address, city/state or coordinates are used as a location fallback.
+A failed address lookup displays “Address unavailable” while retaining the actual
+GPS fix and coordinates for diagnostics. Capture stays blocked. Reverse geocoding
+makes at most three attempts (8-second timeout per attempt, 1/2-second backoff)
+for transient network/timeout, HTTP 408/429 or server failures. Permanent errors
+and missing addresses fail immediately. Resync starts a fresh GPS request and
+lookup. Only a successful, non-aborted lookup for the current, fresh reading can
+resolve the address; obsolete requests and failed lookups cannot authorize capture.
+
 Capture requires reported accuracy at most 100 metres, a reading no older than
 60 seconds, and successful address lookup. Unknown accuracy, stale/invalid
 readings, location errors and address failures block capture. These conservative

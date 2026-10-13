@@ -6,7 +6,7 @@ const vm = require('node:vm');
 const html = fs.readFileSync(require('node:path').join(__dirname, '../index.html'), 'utf8');
 const script = html.match(/<script>\s*\/\/ APP STATE([\s\S]*?)<\/script>/)[1];
 
-function app(fetchImpl = async () => ({ ok: false }), supported = true, fastTimeout = false, config = {}) {
+function app(fetchImpl = async () => ({ ok: false, status: 503 }), supported = true, fastTimeout = false, config = {}) {
     const elements = new Map();
     const requests = [];
     let watchdog;
@@ -20,7 +20,7 @@ function app(fetchImpl = async () => ({ ok: false }), supported = true, fastTime
             requests.push({ success, failure, options });
         } } } : {},
         fetch: fetchImpl, AbortController,
-        setTimeout: (callback, ms) => ms === 15000 ? (watchdog = callback, 0) : setTimeout(callback, fastTimeout ? 0 : ms), clearTimeout,
+        setTimeout: (callback, ms) => ms === 15000 ? (watchdog = callback, 0) : setTimeout(callback, ms === 8000 && !fastTimeout ? ms : 0), clearTimeout,
         console: { warn() {} }
     });
     vm.runInContext(script, context);
@@ -73,7 +73,7 @@ test('GPS address uses actual coordinates in the request, UI and exported stamp'
 });
 
 for (const [name, fetchImpl] of [
-    ['HTTP error', async () => ({ ok: false })],
+    ['HTTP error', async () => ({ ok: false, status: 503 })],
     ['network error', async () => { throw new Error('offline'); }],
     ['malformed JSON', async () => ({ ok: true, json: async () => { throw new SyntaxError(); } })],
     ['missing address', async () => ({ ok: true, json: async () => ({}) })],
@@ -85,7 +85,7 @@ for (const [name, fetchImpl] of [
         const a = app(fetchImpl, true, name === 'lookup timeout');
         a.sync();
         await a.fix(0, -33.8688, -151.2093);
-        assert.equal(a.state().lockedAddress, '33.868800° S, 151.209300° W');
+        assert.equal(a.state().lockedAddress, 'Address unavailable');
         checkUI(a);
     });
 }
@@ -248,4 +248,124 @@ test('synchronous geolocation exception fails closed with permission guidance', 
     a.run("navigator.geolocation.getCurrentPosition = () => { throw new Error('blocked') }");
     a.sync(); assert.equal(a.run('locationIsUsable()'), false);
     assert.match(a.elements.get('locationStatus').textContent, /iPhone\/iPad|Android/);
+});
+
+for (const status of [408, 429, 503]) {
+    test(`transient HTTP ${status} recovers within three attempts for the same GPS fix`, async () => {
+        let attempts = 0;
+        const urls = [];
+        const a = app(async url => {
+            urls.push(url);
+            return ++attempts < 3 ? { ok: false, status }
+                : { ok: true, json: async () => ({ display_name: 'Recovered address' }) };
+        });
+        a.sync(); await a.fix(0, -10, 20);
+        assert.equal(attempts, 3);
+        assert.equal(new Set(urls).size, 1);
+        assert.equal(a.state().lockedAddress, 'RECOVERED ADDRESS');
+        assert.equal(a.run('locationIsUsable()'), true);
+    });
+}
+
+test('exhausted retries preserve diagnostics and Resync can recover', async () => {
+    let attempts = 0;
+    let fails = true;
+    const a = app(async () => {
+        attempts++;
+        return fails ? { ok: false, status: 503 }
+            : { ok: true, json: async () => ({ display_name: 'Recovered address' }) };
+    });
+    a.sync(); await a.fix(0, 10, 20);
+    assert.equal(attempts, 3);
+    assert.equal(a.state().lockedAddress, 'Address unavailable');
+    assert.equal(a.state().locationReading.latitude, 10);
+    assert.equal(a.state().locationReading.longitude, 20);
+    assert.equal(a.run('locationIsUsable()'), false);
+    fails = false; a.sync(); await a.fix(1, 30, 40);
+    assert.equal(attempts, 4);
+    assert.equal(a.run('locationIsUsable()'), true);
+    assert.equal(a.state().latitude, '30.000000° N');
+});
+
+for (const response of [
+    { ok: false, status: 400 },
+    { ok: true, json: async () => ({ display_name: '   ', address: { road: ' ' } }) },
+    { ok: true, json: async () => ({ error: 'No address', display_name: 'Invalid address' }) }
+]) {
+    test('permanent or invalid address response fails closed without automatic retry', async () => {
+        let attempts = 0;
+        const a = app(async () => { attempts++; return response; });
+        a.sync(); await a.fix(0, 10, 20);
+        assert.equal(attempts, 1);
+        assert.equal(a.state().lockedAddress, 'Address unavailable');
+        assert.equal(a.run('locationIsUsable()'), false);
+    });
+}
+
+test('a late successful body from a timed-out lookup cannot resolve or unlock capture', async () => {
+    let completeBody;
+    let aborted;
+    let attempts = 0;
+    const a = app(async (_url, { signal }) => {
+        attempts++;
+        if (attempts > 1) return { ok: false, status: 400 };
+        aborted = new Promise(resolve => signal.addEventListener('abort', resolve));
+        return { ok: true, json: () => new Promise(resolve => { completeBody = resolve; }) };
+    }, true, true);
+    a.sync(); const lookup = a.fix(0, 10, 20);
+    await Promise.resolve(); await Promise.resolve(); await aborted;
+    completeBody({ display_name: 'Too late' });
+    await lookup;
+    assert.equal(a.state().lockedAddress, 'Address unavailable');
+    assert.equal(a.run('locationIsUsable()'), false);
+});
+
+test('a fix expiring while its lookup is pending never becomes resolved', async () => {
+    let complete;
+    const a = app(() => new Promise(resolve => { complete = resolve; }));
+    a.sync(); const lookup = a.fix(0, 10, 20);
+    a.run('state.locationReading.timestamp = Date.now() - 61000');
+    complete({ ok: true, json: async () => ({ display_name: 'Expired fix address' }) });
+    await lookup;
+    assert.equal(a.state().locationReady, false);
+    assert.equal(a.state().lockedAddress, 'Address unavailable');
+    assert.equal(a.run('locationIsUsable()'), false);
+});
+
+test('UI updates and a replacement GPS reading cannot inherit address authorization', async () => {
+    const a = app(async () => ({ ok: true, json: async () => ({ display_name: 'Resolved address' }) }));
+    a.sync(); await a.fix(0, 10, 20);
+    a.run('state.locationReading = {...state.locationReading, latitude: 30}');
+    assert.equal(a.run('locationIsUsable()'), false);
+    a.run("updateGpsUI('Display label', '30.000000° N', '20.000000° E')");
+    assert.equal(a.state().locationReady, false);
+    assert.equal(a.state().resolvedLocationReading, null);
+});
+
+test('obsolete successful lookup cannot replace a newer resolved address', async () => {
+    const pending = [];
+    const a = app(() => new Promise(resolve => pending.push(resolve)));
+    a.sync(); const old = a.fix(0, 10, 20);
+    a.sync(); const current = a.fix(1, 30, 40);
+    pending[1]({ ok: true, json: async () => ({ display_name: 'Current address' }) });
+    await current;
+    pending[0]({ ok: true, json: async () => ({ display_name: 'Obsolete address' }) });
+    await old;
+    assert.equal(a.state().lockedAddress, 'CURRENT ADDRESS');
+    assert.equal(a.state().locationReading.latitude, 30);
+    assert.equal(a.run('locationIsUsable()'), true);
+});
+
+test('Resync during retry backoff cancels further obsolete lookups', async () => {
+    const urls = [];
+    const a = app(async url => { urls.push(url); return { ok: false, status: 503 }; });
+    a.sync(); const old = a.fix(0, 10, 20);
+    // Drain the cross-realm promise callbacks before the backoff timer fires.
+    for (let i = 0; i < 10 && !a.state().locationMessage.includes('Retrying'); i++) await Promise.resolve();
+    assert.match(a.state().locationMessage, /Retrying/);
+    a.sync();
+    await old;
+    assert.equal(urls.length, 1);
+    assert.equal(a.state().lockedAddress, 'LOCATING…');
+    assert.equal(a.run('locationIsUsable()'), false);
 });
